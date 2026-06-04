@@ -74,8 +74,10 @@
   <div class="wrap">
     <div class="tabs">
       <button class="tab active" data-key="seq">Request lifecycle</button>
+      <button class="tab" data-key="rules">Resolver chain</button>
       <button class="tab" data-key="flow">Call graph</button>
       <button class="tab" data-key="strat">Strategies (Redis ops)</button>
+      <button class="tab" data-key="boot">Startup</button>
     </div>
 
     <div class="card">
@@ -104,11 +106,12 @@
 
       <div class="legend">
         <span><i class="dot" style="background:#6ea8fe"></i> Middleware</span>
+        <span><i class="dot" style="background:#f49ac2"></i> Rule resolver</span>
         <span><i class="dot" style="background:#7ee0b8"></i> RateLimiter / Endpoint</span>
         <span><i class="dot" style="background:#c89bf0"></i> Strategy</span>
         <span><i class="dot" style="background:#f06868"></i> Redis</span>
         <span><i class="dot" style="background:#f0d868"></i> Key function</span>
-        <span><i class="dot" style="background:#f0a868"></i> Monitoring</span>
+        <span><i class="dot" style="background:#9bd0f0"></i> Startup</span>
       </div>
     </div>
   </div>
@@ -119,27 +122,31 @@
     const TYPES = {
       ext:   { c: "#8c9bb5", t: "External" },
       mw:    { c: "#6ea8fe", t: "Middleware" },
+      rule:  { c: "#f49ac2", t: "Rule resolver" },
       lim:   { c: "#7ee0b8", t: "RateLimiter" },
       strat: { c: "#c89bf0", t: "Strategy" },
       redis: { c: "#f06868", t: "Redis" },
       key:   { c: "#f0d868", t: "Key function" },
       ep:    { c: "#7ee0b8", t: "Endpoint" },
+      boot:  { c: "#9bd0f0", t: "Startup" },
       mon:   { c: "#f0a868", t: "Monitoring" }
     };
 
     const GRAPHS = {
       seq: {
         title: "Request Lifecycle \u2014 /api/user",
-        sub: "Ordered hops for a single request, including the Redis Lua eval and the allow / block branch.",
+        sub: "Ordered hops for a single request: the resolver chain produces an Outcome, then the limiter runs the Redis Lua eval and the allow / block branch.",
         layers: [
           [{ id:"c", t:"ext", label:"Client \u00b7 GET /api/user", desc:"Incoming HTTP request hits the ASGI app.", log:"\u2014 (external, no log)" }],
-          [{ id:"disp", t:"mw", label:"middleware / dispatch", desc:"Middleware entry. Skips excluded paths, resolves the path rule, then calls the limiter.", log:"[middleware/RateLimitMiddleware.dispatch] invoked | method=GET path=/api/user" }],
-          [{ id:"res", t:"mw", label:"middleware / _resolve", desc:"Looks up path_rules['/api/user'] -> limit=50, period=60, key_func=user_key.", log:"[middleware/RateLimitMiddleware._resolve] invoked | path=/api/user" }],
+          [{ id:"disp", t:"mw", label:"middleware / dispatch", desc:"Pure enforcer. Asks app.state.rule_resolver for an Outcome, then enforces it. Owns no rules itself.", log:"[middleware/RateLimitMiddleware.dispatch] invoked | method=GET path=/api/user" }],
+          [{ id:"chain", t:"rule", label:"ChainResolver / resolve", desc:"Chain of Responsibility: asks each link in order; the first non-DEFER outcome wins.", log:"[rules/ChainResolver.resolve] invoked | path=/api/user" }],
+          [{ id:"rov", t:"rule", label:"RedisOverrideResolver / resolve", desc:"No request.state.subscription set, so it returns DEFER and the static rules apply.", log:"[rules/RedisOverrideResolver.resolve] invoked | tier=None" }],
+          [{ id:"stat", t:"rule", label:"StaticRuleResolver / resolve", desc:"Matches path_rules['/api/user'] -> RateLimitRule(limit=50, period=60, key_func=user_key).", log:"[rules/StaticRuleResolver.resolve] invoked | path=/api/user" }],
+          [{ id:"al", t:"rule", label:"rules / as_limit", desc:"Centralized identifier resolution: applies the rule's key_func to build a Limit(RateLimitDecision).", log:"[rules/as_limit] -> Limit(RateLimitDecision(limit=50, period=60, identifier=...))" }],
           [{ id:"uk", t:"key", label:"main / user_key", desc:"Builds identifier from request.state.user_id, falling back to client IP.", log:"[main/user_key] invoked" }],
-          [{ id:"gl", t:"lim", label:"limiter / get_rate_limiter", desc:"Returns the cached RateLimiter singleton (connects on first call).", log:"[limiter/get_rate_limiter] invoked" }],
-          [{ id:"crl", t:"lim", label:"limiter / check_rate_limit", desc:"Applies defaults and delegates to the active strategy.", log:"[limiter/RateLimiter.check_rate_limit] invoked | identifier=ip:127.0.0.1 limit=50 period=60" }],
-          [{ id:"ia", t:"strat", label:"SlidingWindow / is_allowed", desc:"Prepares the atomic check-and-add Lua script.", log:"[strategies/SlidingWindowStrategy.is_allowed] invoked | key=ip:... limit=50 period=60" }],
-          [{ id:"rd", t:"redis", label:"Redis \u00b7 eval(Lua)", desc:"Atomic: ZREMRANGEBYSCORE, ZCARD, conditional ZADD + EXPIRE, ZRANGE.", log:"[strategies/SlidingWindowStrategy.is_allowed] -> redis.eval (sliding-window Lua: ...)" }],
+          [{ id:"crl", t:"lim", label:"limiter / check_rate_limit", desc:"Receives the decision's identifier/limit/period and delegates to the active strategy.", log:"[limiter/RateLimiter.check_rate_limit] invoked | identifier=user:... limit=50 period=60" }],
+          [{ id:"ia", t:"strat", label:"SlidingWindow / is_allowed", desc:"Prepares the atomic check-and-add Lua script.", log:"[strategies/SlidingWindowStrategy.is_allowed] invoked | key=user:... limit=50 period=60" }],
+          [{ id:"rd", t:"redis", label:"Redis \u00b7 eval(Lua)", desc:"Atomic: ZREMRANGEBYSCORE, ZCARD, conditional ZADD + EXPIRE, ZRANGE.", log:"[strategies/SlidingWindowStrategy.is_allowed] -> redis.eval (sliding-window Lua)" }],
           [
             { id:"ep", t:"ep", label:"main / user_endpoint (allowed)", desc:"Handler runs only if the request was allowed.", log:"[main/user_endpoint] invoked" },
             { id:"r429", t:"ext", label:"429 Too Many Requests (blocked)", desc:"Middleware returns a 429 JSON response without calling the handler.", log:"(dispatch returns JSONResponse status 429)" }
@@ -147,42 +154,70 @@
           [{ id:"resp", t:"ext", label:"Response + X-RateLimit-* headers", desc:"Rate-limit headers attached before returning to the client.", log:"X-RateLimit-Limit / -Remaining / -Reset (+ Retry-After if blocked)" }]
         ],
         edges: [
-          ["c","disp"],["disp","res"],["res","uk"],["uk","gl"],["gl","crl"],
-          ["crl","ia"],["ia","rd"],["rd","ep","allowed"],["rd","r429","blocked",true],
+          ["c","disp"],["disp","chain"],["chain","rov"],["rov","stat","DEFER"],["stat","al"],
+          ["al","uk"],["al","crl"],["crl","ia"],["ia","rd"],["rd","ep","allowed"],["rd","r429","blocked",true],
           ["ep","resp"],["r429","resp"]
+        ]
+      },
+      rules: {
+        title: "Rule resolution \u2014 Chain of Responsibility",
+        sub: "app.state.rule_resolver is a ChainResolver. Each link returns an Outcome: Limit (apply), SKIP (bypass) or DEFER (ask next). Identifier building is centralized in as_limit.",
+        layers: [
+          [{ id:"disp", t:"mw", label:"middleware / dispatch", desc:"Awaits resolver.resolve(request): enforces Limit, passes through on SKIP, logs an error on DEFER (misconfiguration).", log:"[middleware/RateLimitMiddleware.dispatch] -> rule_resolver.resolve" }],
+          [{ id:"chain", t:"rule", label:"ChainResolver / resolve", desc:"Iterates links and returns the first non-DEFER outcome. The terminal StaticRuleResolver guarantees a result.", log:"[rules/ChainResolver.resolve] handled by <Link>" }],
+          [
+            { id:"rov", t:"rule", label:"RedisOverrideResolver / resolve", desc:"Reads ratelimit:tier:<tier> from Redis. bypass -> SKIP; limit/period -> Limit; nothing -> DEFER.", log:"[rules/RedisOverrideResolver.resolve] invoked | tier=..." },
+            { id:"stat", t:"rule", label:"StaticRuleResolver / resolve", desc:"Excluded path -> SKIP; otherwise a path rule or the defaults -> Limit. Never DEFERs (terminal).", log:"[rules/StaticRuleResolver.resolve] invoked | path=..." }
+          ],
+          [
+            { id:"hg", t:"redis", label:"Redis \u00b7 hgetall(tier)", desc:"Per-subscription override lookup. Evolve limits with no deploy.", log:"[rules/RedisOverrideResolver.resolve] -> redis.hgetall" },
+            { id:"al", t:"rule", label:"rules / as_limit", desc:"The single place that applies key_func (the rule's or the default) to build a RateLimitDecision.", log:"[rules/as_limit] -> Limit(RateLimitDecision(...))" }
+          ],
+          [
+            { id:"lim", t:"lim", label:"Outcome = Limit \u2192 check_rate_limit", desc:"The decision carries identifier/limit/period for the limiter to enforce.", log:"enforce: limiter.check_rate_limit(decision...)" },
+            { id:"skip", t:"ext", label:"Outcome = SKIP \u2192 call_next", desc:"Bypass rate limiting entirely (e.g. enterprise tier, or an excluded path).", log:"[middleware/...dispatch] SKIP, bypassing rate limit" },
+            { id:"defer", t:"ext", label:"Outcome = DEFER \u2192 call_next + error", desc:"Should never reach the middleware; indicates the chain lacks a terminal resolver.", log:"[middleware/...dispatch] rule chain terminated with DEFER (misconfiguration)" }
+          ]
+        ],
+        edges: [
+          ["disp","chain"],["chain","rov"],["chain","stat"],
+          ["rov","hg"],["rov","al"],["stat","al"],
+          ["rov","skip","bypass"],["stat","skip","excluded"],["al","lim"],["chain","defer","all defer",true]
         ]
       },
       flow: {
         title: "Call Graph \u2014 modules & functions",
-        sub: "Every node is a [module/function]; arrows are invocations. Dashed = observability side-channel.",
+        sub: "Every node is a [module/function]; arrows are invocations. The middleware owns no rules \u2014 it delegates to the resolver chain.",
         layers: [
           [{ id:"c", t:"ext", label:"HTTP Request", desc:"Client request entering the app.", log:"\u2014" }],
-          [{ id:"disp", t:"mw", label:"middleware / dispatch", desc:"Central enforcement point for every request.", log:"[middleware/RateLimitMiddleware.dispatch] invoked | method=... path=..." }],
+          [{ id:"disp", t:"mw", label:"middleware / dispatch", desc:"Central enforcement point for every request. Owns no rules.", log:"[middleware/RateLimitMiddleware.dispatch] invoked | method=... path=..." }],
           [
-            { id:"res", t:"mw", label:"middleware / _resolve", desc:"Picks limit/period/key_func for the path.", log:"[middleware/RateLimitMiddleware._resolve] invoked | path=..." },
-            { id:"gl", t:"lim", label:"limiter / get_rate_limiter", desc:"Returns / lazily builds the singleton.", log:"[limiter/get_rate_limiter] invoked" },
-            { id:"crl", t:"lim", label:"limiter / check_rate_limit", desc:"Delegates to the configured strategy.", log:"[limiter/RateLimiter.check_rate_limit] invoked | identifier=... limit=... period=..." }
+            { id:"chain", t:"rule", label:"ChainResolver / resolve", desc:"Asks each link in order; the first non-DEFER outcome wins.", log:"[rules/ChainResolver.resolve] invoked | path=..." },
+            { id:"crl", t:"lim", label:"limiter / check_rate_limit", desc:"Delegates to the configured strategy when the Outcome is a Limit.", log:"[limiter/RateLimiter.check_rate_limit] invoked | identifier=... limit=... period=..." }
           ],
           [
-            { id:"kd", t:"key", label:"middleware / _default_key_func", desc:"Default IP-based identifier.", log:"[middleware/RateLimitMiddleware._default_key_func] invoked" },
-            { id:"uk", t:"key", label:"main / user_key", desc:"Per-user identifier (used by /api/user).", log:"[main/user_key] invoked" },
-            { id:"ek", t:"key", label:"main / endpoint_ip_key", desc:"Per-endpoint+IP identifier (used by /api/strict).", log:"[main/endpoint_ip_key] invoked" },
-            { id:"con", t:"lim", label:"limiter / connect", desc:"Builds the Redis connection pool.", log:"[limiter/RateLimiter.connect] invoked | strategy_type=..." },
+            { id:"rov", t:"rule", label:"RedisOverrideResolver / resolve", desc:"Per-subscription override (SKIP / Limit / DEFER).", log:"[rules/RedisOverrideResolver.resolve] invoked | tier=..." },
+            { id:"stat", t:"rule", label:"StaticRuleResolver / resolve", desc:"Path rules + defaults; excluded path -> SKIP.", log:"[rules/StaticRuleResolver.resolve] invoked | path=..." },
             { id:"ia", t:"strat", label:"strategies / *.is_allowed", desc:"Fixed / Sliding / Token implementation.", log:"[strategies/<Strategy>.is_allowed] invoked | key=... limit=... period=..." },
             { id:"ep", t:"ep", label:"main / endpoint", desc:"The matched route handler (if allowed).", log:"[main/<endpoint>] invoked" }
           ],
           [
-            { id:"kc", t:"key", label:"main / get_client_identifier", desc:"Shared helper returning ip:<host>.", log:"[main/get_client_identifier] invoked" },
-            { id:"rf", t:"redis", label:"redis.from_url", desc:"Establishes the async connection pool.", log:"[limiter/RateLimiter.connect] -> redis.from_url" },
+            { id:"al", t:"rule", label:"rules / as_limit", desc:"Builds RateLimitDecision via key_func (centralized).", log:"[rules/as_limit] -> Limit(RateLimitDecision(...))" },
+            { id:"hg", t:"redis", label:"Redis \u00b7 hgetall", desc:"Tier override lookup issued by RedisOverrideResolver.", log:"[rules/RedisOverrideResolver.resolve] -> redis.hgetall" },
             { id:"rds", t:"redis", label:"Redis \u00b7 eval / pipeline", desc:"Atomic Lua eval or pipelined commands.", log:"[strategies/<Strategy>.is_allowed] -> redis.eval / redis.pipeline.execute" },
-            { id:"mon", t:"mon", label:"monitoring / record_check", desc:"Prometheus counters / histograms.", log:"[monitoring/RateLimitMonitor.record_check] invoked | identifier=... strategy=..." },
             { id:"resp", t:"ext", label:"Response + headers", desc:"Final response to the client.", log:"X-RateLimit-* headers" }
+          ],
+          [
+            { id:"uk", t:"key", label:"main / user_key", desc:"Per-user identifier (used by /api/user).", log:"[main/user_key] invoked" },
+            { id:"ek", t:"key", label:"main / endpoint_ip_key", desc:"Per-endpoint+IP identifier (used by /api/strict).", log:"[main/endpoint_ip_key] invoked" },
+            { id:"kc", t:"key", label:"main / get_client_identifier", desc:"Default key func returning ip:<host>.", log:"[main/get_client_identifier] invoked" }
           ]
         ],
         edges: [
-          ["c","disp"],["disp","res"],["disp","gl"],["disp","crl"],["disp","ep","allowed"],
-          ["res","kd"],["res","uk"],["res","ek"],["uk","kc"],["ek","kc"],
-          ["gl","con"],["con","rf"],["crl","ia"],["ia","rds"],["crl","mon","observability",true],["ep","resp"]
+          ["c","disp"],["disp","chain"],["disp","crl"],["disp","ep","allowed"],
+          ["chain","rov"],["chain","stat"],["rov","hg"],["rov","al"],["stat","al"],
+          ["al","uk"],["al","ek"],["al","kc"],["uk","kc"],["ek","kc"],
+          ["crl","ia"],["ia","rds"],["ep","resp"]
         ]
       },
       strat: {
@@ -208,6 +243,32 @@
         ],
         edges: [
           ["fwi","fwio"],["fwr","fwro"],["swi","swio"],["swr","swro"],["tbi","tbio"],["tbr","tbro"]
+        ]
+      },
+      boot: {
+        title: "Application startup \u2014 lifespan wiring",
+        sub: "All shared infrastructure is assembled once and stored on app.state. The Redis pool is created a single time and reused everywhere.",
+        layers: [
+          [{ id:"ls", t:"boot", label:"main / lifespan (startup)", desc:"FastAPI lifespan. Builds the shared pool, client, limiter and resolver, then stores them on app.state.", log:"[main/lifespan] invoked" }],
+          [
+            { id:"ip", t:"boot", label:"redis_client / init_pool", desc:"Creates the single shared Redis ConnectionPool for the whole app.", log:"[redis_client/init_pool] invoked" },
+            { id:"gc", t:"boot", label:"redis_client / get_client", desc:"Returns a redis.Redis bound to the shared pool.", log:"[redis_client/get_client] invoked" },
+            { id:"mk", t:"lim", label:"RateLimiter(redis_client)", desc:"Client is injected; the strategy is built in __init__. No connect() step.", log:"[limiter/RateLimiter.__init__] invoked | strategy_type=..." },
+            { id:"rr", t:"rule", label:"ChainResolver([...]) (module-level)", desc:"RedisOverrideResolver + StaticRuleResolver, defined above lifespan.", log:"[rules/ChainResolver.__init__] invoked | links=[...]" }
+          ],
+          [
+            { id:"pool", t:"redis", label:"ConnectionPool.from_url", desc:"The async pool shared by limiter, resolvers and /health.", log:"[redis_client/init_pool] -> ConnectionPool.from_url" },
+            { id:"sr", t:"redis", label:"app.state.redis", desc:"Shared client read by the limiter, RedisOverrideResolver and the /health ping.", log:"app.state.redis = get_client()" },
+            { id:"bs", t:"strat", label:"RateLimiter / _build_strategy", desc:"Selects the Fixed / Sliding / Token strategy.", log:"[limiter/RateLimiter._build_strategy] invoked | strategy_type=..." },
+            { id:"sl", t:"lim", label:"app.state.limiter", desc:"Shared RateLimiter instance used by the middleware and endpoints.", log:"app.state.limiter = RateLimiter(...)" },
+            { id:"sres", t:"rule", label:"app.state.rule_resolver", desc:"Shared resolver chain the middleware reads on every request (hot-swappable).", log:"app.state.rule_resolver = rule_resolver" }
+          ],
+          [{ id:"cp", t:"boot", label:"redis_client / close_pool (shutdown)", desc:"On shutdown the shared pool is disconnected.", log:"[redis_client/close_pool] -> pool.disconnect" }]
+        ],
+        edges: [
+          ["ls","ip"],["ls","gc"],["ls","mk"],["ls","rr"],
+          ["ip","pool"],["gc","sr"],["mk","bs"],["mk","sl"],["rr","sres"],
+          ["ls","cp","on shutdown",true]
         ]
       }
     };

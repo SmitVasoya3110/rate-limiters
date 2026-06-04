@@ -22,7 +22,8 @@ A comprehensive, production-ready API rate limiting solution built with FastAPI 
   - Per-user rate limiting
   - Per-endpoint rate limiting
   - Custom identifier functions
-  - Dynamic limit configuration
+  - Pluggable **rule resolvers** (policy decoupled from the middleware)
+  - **Dynamic, per-subscription limits** and bypass via Redis — no redeploy
 
 ## Architecture
 
@@ -45,6 +46,27 @@ A comprehensive, production-ready API rate limiting solution built with FastAPI 
 - Allows controlled bursts
 - Smooth rate limiting
 - Best for APIs with variable load
+
+### Rule Resolution (policy vs. mechanism)
+
+The middleware is a thin **enforcer**; it owns no rules. On every request it asks
+`app.state.rule_resolver` for an `Outcome`:
+
+- `Limit(decision)` — apply a concrete limit
+- `SKIP` — bypass rate limiting entirely (excluded paths, enterprise tier, ...)
+- `DEFER` — no opinion; ask the next resolver in the chain
+
+Resolvers (`app/rules.py`) implement a common `RuleResolver` interface and compose
+as a **Chain of Responsibility** via `ChainResolver`:
+
+- `StaticRuleResolver` — in-memory path rules + defaults (terminal)
+- `RedisOverrideResolver` — per-subscription overrides read from Redis
+- ... your own (`DatabaseOverrideResolver`, `TierOverrideResolver`, ...)
+
+The Redis connection pool itself is created once at startup by `app/redis_client.py`
+and shared via `app.state.redis`.
+
+See `docs/flow.html` for an interactive diagram of these flows.
 
 ## Installation
 
@@ -110,18 +132,32 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ### Using Middleware (Global Rate Limiting)
 
+The middleware takes no rule arguments. Rules come from `app.state.rule_resolver`,
+which you assemble (typically in the app's `lifespan`):
+
 ```python
 from fastapi import FastAPI
 from app.middleware import RateLimitMiddleware
+from app.rules import ChainResolver, StaticRuleResolver, RateLimitRule
 
 app = FastAPI()
+app.add_middleware(RateLimitMiddleware)  # pure enforcer, no rule config
 
-app.add_middleware(
-    RateLimitMiddleware,
-    limit=100,
-    period=60,
-    key_func=lambda request: f"ip:{request.client.host}"
-)
+rule_resolver = ChainResolver([
+    StaticRuleResolver(
+        default_limit=100,
+        default_period=60,
+        excluded_paths=["/", "/health", "/metrics"],
+        path_rules={
+            "/api/limited": RateLimitRule(limit=10, period=60),
+        },
+    ),
+])
+
+@app.on_event("startup")
+async def _wire():
+    app.state.rule_resolver = rule_resolver
+    # app.state.redis / app.state.limiter are set up in lifespan (see app/main.py)
 ```
 
 ### Using Decorators (Per-Endpoint Rate Limiting)
@@ -150,12 +186,15 @@ async def strict_endpoint(request: Request):
 
 ### Custom Rate Limiter
 
+The Redis client is injected; connection lifecycle lives in `app/redis_client.py`:
+
 ```python
 from app.rate_limiter import RateLimiter, StrategyType
+from app.redis_client import init_pool, get_client, close_pool
 
-# Initialize with specific strategy
-limiter = RateLimiter(strategy_type=StrategyType.SLIDING_WINDOW)
-await limiter.connect()
+# Build the shared pool once, then a client-injected limiter
+init_pool()
+limiter = RateLimiter(get_client(), strategy_type=StrategyType.SLIDING_WINDOW)
 
 # Check rate limit
 result = await limiter.check_rate_limit(
@@ -172,7 +211,8 @@ else:
 # Reset rate limit
 await limiter.reset_limit("user:123")
 
-await limiter.disconnect()
+# On shutdown
+await close_pool()
 ```
 
 ## API Endpoints
@@ -379,12 +419,17 @@ redis-cli -h localhost -p 6379 ping
 
 ### Custom Identifier Function
 
+Identifier logic lives in the resolver (via `default_key_func` or a rule's `key_func`),
+not in the middleware:
+
 ```python
+from app.rules import StaticRuleResolver
+
 def custom_identifier(request: Request) -> str:
     # Combine multiple factors
     user_id = getattr(request.state, "user_id", None)
     api_key = request.headers.get("X-API-Key")
-    
+
     if user_id:
         return f"user:{user_id}"
     elif api_key:
@@ -392,11 +437,37 @@ def custom_identifier(request: Request) -> str:
     else:
         return f"ip:{request.client.host}"
 
-app.add_middleware(
-    RateLimitMiddleware,
-    key_func=custom_identifier
+app.state.rule_resolver = StaticRuleResolver(
+    default_limit=100,
+    default_period=60,
+    default_key_func=custom_identifier,
 )
 ```
+
+### Dynamic / Per-Subscription Limits (no redeploy)
+
+Use `RedisOverrideResolver` (or your own `RuleResolver`) ahead of the static rules.
+It reads a per-tier override from Redis, so limits can change at runtime:
+
+```python
+from app.rules import ChainResolver, RedisOverrideResolver, StaticRuleResolver
+
+app.state.rule_resolver = ChainResolver([
+    RedisOverrideResolver(),                 # SKIP / Limit / DEFER from Redis
+    StaticRuleResolver(default_limit=100, default_period=60),  # terminal fallback
+])
+```
+
+```bash
+# Enterprise tier bypasses rate limiting entirely
+redis-cli HSET ratelimit:tier:enterprise bypass 1
+
+# Pro tier gets a higher limit
+redis-cli HSET ratelimit:tier:pro limit 5000 period 60
+```
+
+The tier is read from `request.state.subscription` (populate it from an upstream
+auth middleware).
 
 ### Multiple Rate Limits
 

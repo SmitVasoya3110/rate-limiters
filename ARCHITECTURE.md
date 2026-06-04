@@ -2,53 +2,72 @@
 
 ## System Overview
 
-The API Rate Limiter is built with a modular architecture that separates concerns and allows for easy extension and customization.
+The API Rate Limiter is built with a modular architecture that separates concerns and allows for easy extension and customization. Two design ideas dominate the current layout:
+
+- **Policy vs. mechanism**: a swappable **Rule Resolver** decides *which* limit applies (or whether to bypass), while the middleware is a thin *enforcer* that knows nothing about rules.
+- **Shared infrastructure assembled once**: the FastAPI `lifespan` creates a single Redis connection pool and the shared `RateLimiter` / resolver, exposing them on `app.state`.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      FastAPI Application                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  ┌──────────────┐         ┌─────────────────┐              │
-│  │  Middleware  │────────▶│   Decorators    │              │
-│  └──────────────┘         └─────────────────┘              │
-│         │                          │                         │
-│         └──────────┬───────────────┘                         │
-│                    ▼                                         │
-│         ┌──────────────────────┐                            │
-│         │   Rate Limiter Core  │                            │
-│         └──────────────────────┘                            │
-│                    │                                         │
-│         ┌──────────┴──────────┐                             │
-│         ▼                     ▼                              │
-│  ┌─────────────┐      ┌─────────────┐                      │
-│  │  Strategies │      │  Monitoring │                       │
-│  └─────────────┘      └─────────────┘                      │
-│         │                                                    │
-│         ▼                                                    │
-│  ┌─────────────┐                                            │
-│  │    Redis    │                                            │
-│  └─────────────┘                                            │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      FastAPI Application                          │
+│   lifespan builds the shared pool, limiter & resolver on          │
+│   app.state at startup; close_pool() on shutdown                  │
+├─────────────────────────────────────────────────────────────────┤
+│   HTTP request                                                    │
+│        │                                                          │
+│        ▼                                                          │
+│  ┌──────────────┐   resolve()    ┌──────────────────────────┐     │
+│  │  Middleware  │ ─────────────▶ │   Rule Resolver (chain)  │     │
+│  │ (enforcer)   │ ◀── Outcome ── │  Redis override → Static │     │
+│  └──────┬───────┘                └──────────────────────────┘     │
+│         │ Limit (decision)                                        │
+│         ▼                                                         │
+│  ┌──────────────────────┐                                        │
+│  │   Rate Limiter Core  │   (also reachable via @decorators)      │
+│  └──────────┬───────────┘                                        │
+│             ▼                                                     │
+│      ┌─────────────┐                                              │
+│      │  Strategies │                                              │
+│      └──────┬──────┘                                              │
+│             ▼                                                     │
+│  ┌──────────────────────┐      ┌──────────────┐                  │
+│  │ redis_client (pool)  │ ───▶ │     Redis    │                  │
+│  └──────────────────────┘      └──────────────┘                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+> See `docs/flow.html` for an interactive, clickable version of these flows
+> (request lifecycle, resolver chain, call graph, strategies, and startup wiring).
 
 ## Core Components
 
+### 0. Connection Management (`app/redis_client.py`)
+
+Owns the **single shared Redis connection pool** for the whole process, keeping connection lifecycle out of the rate-limiting logic.
+
+**Functions:**
+- `init_pool()`: Build the shared `redis.asyncio.ConnectionPool` (honours `REDIS_SSL`). Called once at startup.
+- `get_client()`: Return a `redis.Redis` bound to the shared pool.
+- `close_pool()`: Disconnect the pool on shutdown.
+
+The `RateLimiter` and resolvers receive a client; they never build or own connections.
+
 ### 1. Rate Limiter Core (`app/rate_limiter/limiter.py`)
 
-The central component that orchestrates rate limiting operations.
+The central component that orchestrates rate limiting operations. The Redis client is **injected** (no connection management here).
 
 **Responsibilities:**
-- Manage Redis connections
-- Initialize and switch between strategies
-- Provide high-level API for rate limit checks
+- Build and switch between strategies (`_build_strategy`)
+- Provide a high-level API for rate limit checks
 - Generate identifiers from request context
 
+**Constructor:**
+- `RateLimiter(redis_client, strategy_type=StrategyType.SLIDING_WINDOW)`
+
 **Key Methods:**
-- `connect()`: Establish Redis connection
-- `check_rate_limit()`: Check if request is allowed
-- `reset_limit()`: Reset rate limit for identifier
-- `get_identifier()`: Generate unique identifier
+- `check_rate_limit(identifier, limit=None, period=None)`: Check if a request is allowed
+- `reset_limit(identifier)`: Reset the rate limit for an identifier
+- `get_identifier(key_func=None, **kwargs)`: Generate a unique identifier
 
 ### 2. Strategy Pattern (`app/rate_limiter/strategies.py`)
 
@@ -117,23 +136,42 @@ Implements different rate limiting algorithms using the Strategy pattern.
 
 **Use Case:** APIs with variable load, burst support needed
 
+### 2b. Rule Resolution (`app/rules.py`)
+
+Separates **policy** (which limit applies) from **mechanism** (the middleware). All resolvers implement the `RuleResolver` interface and return an `Outcome`.
+
+**Outcome model (illegal states unrepresentable):**
+- `Limit(decision)` — apply a concrete `RateLimitDecision(limit, period, identifier)`
+- `SKIP` — bypass rate limiting entirely (e.g. enterprise tier, excluded paths)
+- `DEFER` — no opinion; ask the next resolver in the chain
+
+**Resolvers:**
+- `StaticRuleResolver`: in-memory path rules + defaults; excluded paths → `SKIP`. Terminal (never `DEFER`).
+- `RedisOverrideResolver`: reads `ratelimit:tier:<tier>` from Redis for per-subscription overrides → `SKIP` / `Limit` / `DEFER`.
+- `ChainResolver`: **Chain of Responsibility** — asks each link in order, the first non-`DEFER` outcome wins; composable.
+
+**Helpers:**
+- `as_limit(rule, request, default_key_func)`: the *single* place that applies a key function to build a `RateLimitDecision`, so links never duplicate identifier logic.
+- `default_ip_key(request)`: default `ip:<host>` key function.
+
+Because the resolver lives on `app.state.rule_resolver` and `resolve()` is async, limits can be **hot-swapped at runtime** and **evolved per subscription** (via Redis/DB) without code changes.
+
 ### 3. Middleware (`app/middleware.py`)
 
-FastAPI middleware for global rate limiting.
+A thin **enforcer**. It owns no rules: it asks `app.state.rule_resolver` for an `Outcome` and enforces it.
 
 **Flow:**
 ```
-Request → Middleware → Rate Limiter → Strategy → Redis
-                ↓
-         Add Headers
-                ↓
-         Response/429
+Request → Middleware → rule_resolver.resolve() → Outcome
+   ├─ Limit  → RateLimiter → Strategy → Redis → add headers → Response/429
+   ├─ SKIP   → call_next (bypass)
+   └─ DEFER  → log error (misconfig) + call_next
 ```
 
 **Features:**
-- Automatic rate limit checking
+- Delegates rule resolution (no `path_rules`/`key_func` knowledge)
 - Response header injection
-- Error handling
+- Fail-open error handling
 - Logging
 
 ### 4. Decorators (`app/decorators.py`)
@@ -160,31 +198,55 @@ Prometheus metrics integration for observability.
 - `rate_limit_check_duration`: Histogram
 - `rate_limit_remaining_tokens`: Gauge
 
+## Application Lifecycle
+
+Shared infrastructure is built once in the FastAPI `lifespan` (`app/main.py`):
+
+```
+startup:
+  init_pool()                       # redis_client: single shared pool
+  app.state.redis    = get_client()
+  app.state.limiter  = RateLimiter(app.state.redis, ...)
+  app.state.rule_resolver = rule_resolver   # ChainResolver([...])
+shutdown:
+  close_pool()
+```
+
+The middleware and endpoints read these off `app.state` per request, so there is exactly one pool and one resolver for the process.
+
 ## Data Flow
 
 ### Successful Request Flow
 
 ```
 1. Request arrives
-2. Middleware/Decorator extracts identifier
-3. Rate Limiter checks Redis
-4. Strategy evaluates limit
-5. Headers added to response
-6. Request processed
+2. Middleware calls rule_resolver.resolve(request) -> Outcome
+3. Outcome is a Limit -> RateLimiter.check_rate_limit(decision)
+4. Strategy evaluates the limit against Redis
+5. X-RateLimit-* headers added to response
+6. Request processed by the handler
 7. Response returned
+```
+
+### Bypassed Request Flow (SKIP)
+
+```
+1. Request arrives
+2. rule_resolver returns SKIP (excluded path or e.g. enterprise tier)
+3. Middleware calls call_next without checking any limit
+4. Response returned (no rate-limit headers)
 ```
 
 ### Rate Limited Request Flow
 
 ```
 1. Request arrives
-2. Middleware/Decorator extracts identifier
-3. Rate Limiter checks Redis
-4. Strategy determines limit exceeded
-5. 429 response generated
-6. Retry-After header added
-7. Error logged
-8. Response returned
+2. Middleware resolves a Limit and calls the RateLimiter
+3. Strategy determines the limit is exceeded
+4. 429 response generated
+5. Retry-After header added
+6. Rate-limit violation logged
+7. Response returned
 ```
 
 ## Redis Data Structures
@@ -374,6 +436,29 @@ Provide custom key function:
 def custom_key(request: Request) -> str:
     # Extract custom identifier
     return f"custom:{value}"
+```
+
+### Custom Resolvers
+
+Implement the `RuleResolver` interface and slot it into the chain to evolve policy without touching the middleware:
+
+```python
+from app.rules import RuleResolver, Outcome, SKIP, DEFER, as_limit, RateLimitRule
+
+class DatabaseOverrideResolver(RuleResolver):
+    async def resolve(self, request) -> Outcome:
+        plan = await load_plan_from_db(request)   # your lookup
+        if plan is None:
+            return DEFER                            # let the next link decide
+        if plan.unlimited:
+            return SKIP                             # bypass entirely
+        return as_limit(RateLimitRule(plan.limit, plan.period), request)
+
+# Compose: most specific/dynamic first, terminal resolver last
+app.state.rule_resolver = ChainResolver([
+    DatabaseOverrideResolver(),
+    StaticRuleResolver(default_limit=100, default_period=60),
+])
 ```
 
 ### Custom Monitoring
