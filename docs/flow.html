@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>API Rate Limiter &mdash; Invocation Flow</title>
+  <style>
+    :root {
+      --bg: #0b0f17; --panel: #131a26; --panel-2: #1a2334; --border: #243049;
+      --text: #e6edf6; --muted: #8c9bb5; --accent: #6ea8fe; --accent-2: #7ee0b8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; color: var(--text); min-height: 100vh;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: radial-gradient(1200px 600px at 80% -10%, #182238 0%, var(--bg) 55%);
+    }
+    header { padding: 28px 32px 12px; border-bottom: 1px solid var(--border); }
+    header h1 { margin: 0 0 6px; font-size: 22px; }
+    header p { margin: 0; color: var(--muted); font-size: 14px; }
+    .wrap { padding: 20px 32px 64px; max-width: 1220px; margin: 0 auto; }
+    .tabs { display: flex; gap: 8px; margin: 22px 0 18px; flex-wrap: wrap; }
+    .tab {
+      background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+      padding: 9px 16px; border-radius: 10px; cursor: pointer; font-size: 13.5px; transition: all .15s ease;
+    }
+    .tab:hover { color: var(--text); border-color: var(--accent); }
+    .tab.active { color: #08111f; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+    .card {
+      background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+      border: 1px solid var(--border); border-radius: 16px; padding: 22px;
+      box-shadow: 0 18px 40px -24px rgba(0,0,0,.8);
+    }
+    #gtitle { margin: 2px 0 4px; font-size: 16px; }
+    .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+    code { background: #0c1320; border: 1px solid var(--border); padding: 1px 6px; border-radius: 6px; color: var(--accent-2); font-size: 12.5px; }
+    .graphwrap { display: grid; grid-template-columns: 1fr 300px; gap: 18px; }
+    @media (max-width: 880px) { .graphwrap { grid-template-columns: 1fr; } }
+    .graph { position: relative; overflow: auto; background: #0d1422; border: 1px solid var(--border); border-radius: 12px; padding: 26px; }
+    .layers { position: relative; display: flex; gap: 64px; align-items: center; min-width: max-content; min-height: 340px; }
+    .layer { display: flex; flex-direction: column; gap: 18px; justify-content: center; }
+    svg.edges { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; z-index: 1; }
+    svg.edges path.edge { fill: none; stroke: #3a4664; stroke-width: 1.6; marker-end: url(#arrow); transition: stroke .12s, opacity .12s; }
+    svg.edges path.edge.hl { stroke: var(--accent); stroke-width: 2.2; marker-end: url(#arrowhl); }
+    svg.edges path.edge.dim { opacity: .12; }
+    .node {
+      position: relative; z-index: 2; min-width: 180px; max-width: 250px; padding: 9px 12px;
+      border-radius: 10px; border: 1px solid var(--border); background: var(--panel-2); cursor: pointer;
+      transition: transform .12s, box-shadow .12s, opacity .12s;
+    }
+    .node:hover { transform: translateY(-2px); }
+    .node.sel { box-shadow: 0 0 0 2px var(--accent); }
+    .node.dim { opacity: .25; }
+    .node .ntag { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 2px; }
+    .node .nlabel { font-size: 12.5px; font-weight: 600; line-height: 1.3; word-break: break-word; }
+    .detail { background: #0d1422; border: 1px solid var(--border); border-radius: 12px; padding: 16px; height: fit-content; position: sticky; top: 16px; }
+    .detail h3 { margin: 0 0 10px; font-size: 14px; word-break: break-word; }
+    .detail p { margin: 0 0 12px; font-size: 13px; line-height: 1.45; }
+    .detail .log { background: #0b1018; border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--accent-2); white-space: pre-wrap; word-break: break-word; }
+    .detail .badge { display: inline-block; font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px; padding: 2px 9px; border-radius: 999px; margin-bottom: 10px; color: #08111f; font-weight: 700; }
+    .muted { color: var(--muted); }
+    .legend { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 18px; font-size: 12.5px; color: var(--muted); }
+    .legend span { display: inline-flex; align-items: center; gap: 7px; }
+    .dot { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+    footer { color: var(--muted); font-size: 12px; padding: 0 32px 30px; text-align: center; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>API Rate Limiter &mdash; Invocation Flow</h1>
+    <p>Click any node to see what it does and the exact <code>[module/function]</code> log line it emits. Self-contained &mdash; no external dependencies.</p>
+  </header>
+
+  <div class="wrap">
+    <div class="tabs">
+      <button class="tab active" data-key="seq">Request lifecycle</button>
+      <button class="tab" data-key="flow">Call graph</button>
+      <button class="tab" data-key="strat">Strategies (Redis ops)</button>
+    </div>
+
+    <div class="card">
+      <h2 id="gtitle"></h2>
+      <div class="sub" id="gsub"></div>
+      <div class="graphwrap">
+        <div class="graph">
+          <div class="layers" id="layers">
+            <svg class="edges" id="edges">
+              <defs>
+                <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M0,0 L10,5 L0,10 z" fill="#3a4664"></path>
+                </marker>
+                <marker id="arrowhl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M0,0 L10,5 L0,10 z" fill="#6ea8fe"></path>
+                </marker>
+              </defs>
+            </svg>
+          </div>
+        </div>
+        <aside class="detail" id="detail">
+          <h3>Click any node</h3>
+          <p class="muted">Select a box to see its role and the exact <code>[module/function]</code> log line.</p>
+        </aside>
+      </div>
+
+      <div class="legend">
+        <span><i class="dot" style="background:#6ea8fe"></i> Middleware</span>
+        <span><i class="dot" style="background:#7ee0b8"></i> RateLimiter / Endpoint</span>
+        <span><i class="dot" style="background:#c89bf0"></i> Strategy</span>
+        <span><i class="dot" style="background:#f06868"></i> Redis</span>
+        <span><i class="dot" style="background:#f0d868"></i> Key function</span>
+        <span><i class="dot" style="background:#f0a868"></i> Monitoring</span>
+      </div>
+    </div>
+  </div>
+
+  <footer>Generated for the api-rate-limiter project &middot; open this file in any browser.</footer>
+
+  <script>
+    const TYPES = {
+      ext:   { c: "#8c9bb5", t: "External" },
+      mw:    { c: "#6ea8fe", t: "Middleware" },
+      lim:   { c: "#7ee0b8", t: "RateLimiter" },
+      strat: { c: "#c89bf0", t: "Strategy" },
+      redis: { c: "#f06868", t: "Redis" },
+      key:   { c: "#f0d868", t: "Key function" },
+      ep:    { c: "#7ee0b8", t: "Endpoint" },
+      mon:   { c: "#f0a868", t: "Monitoring" }
+    };
+
+    const GRAPHS = {
+      seq: {
+        title: "Request Lifecycle \u2014 /api/user",
+        sub: "Ordered hops for a single request, including the Redis Lua eval and the allow / block branch.",
+        layers: [
+          [{ id:"c", t:"ext", label:"Client \u00b7 GET /api/user", desc:"Incoming HTTP request hits the ASGI app.", log:"\u2014 (external, no log)" }],
+          [{ id:"disp", t:"mw", label:"middleware / dispatch", desc:"Middleware entry. Skips excluded paths, resolves the path rule, then calls the limiter.", log:"[middleware/RateLimitMiddleware.dispatch] invoked | method=GET path=/api/user" }],
+          [{ id:"res", t:"mw", label:"middleware / _resolve", desc:"Looks up path_rules['/api/user'] -> limit=50, period=60, key_func=user_key.", log:"[middleware/RateLimitMiddleware._resolve] invoked | path=/api/user" }],
+          [{ id:"uk", t:"key", label:"main / user_key", desc:"Builds identifier from request.state.user_id, falling back to client IP.", log:"[main/user_key] invoked" }],
+          [{ id:"gl", t:"lim", label:"limiter / get_rate_limiter", desc:"Returns the cached RateLimiter singleton (connects on first call).", log:"[limiter/get_rate_limiter] invoked" }],
+          [{ id:"crl", t:"lim", label:"limiter / check_rate_limit", desc:"Applies defaults and delegates to the active strategy.", log:"[limiter/RateLimiter.check_rate_limit] invoked | identifier=ip:127.0.0.1 limit=50 period=60" }],
+          [{ id:"ia", t:"strat", label:"SlidingWindow / is_allowed", desc:"Prepares the atomic check-and-add Lua script.", log:"[strategies/SlidingWindowStrategy.is_allowed] invoked | key=ip:... limit=50 period=60" }],
+          [{ id:"rd", t:"redis", label:"Redis \u00b7 eval(Lua)", desc:"Atomic: ZREMRANGEBYSCORE, ZCARD, conditional ZADD + EXPIRE, ZRANGE.", log:"[strategies/SlidingWindowStrategy.is_allowed] -> redis.eval (sliding-window Lua: ...)" }],
+          [
+            { id:"ep", t:"ep", label:"main / user_endpoint (allowed)", desc:"Handler runs only if the request was allowed.", log:"[main/user_endpoint] invoked" },
+            { id:"r429", t:"ext", label:"429 Too Many Requests (blocked)", desc:"Middleware returns a 429 JSON response without calling the handler.", log:"(dispatch returns JSONResponse status 429)" }
+          ],
+          [{ id:"resp", t:"ext", label:"Response + X-RateLimit-* headers", desc:"Rate-limit headers attached before returning to the client.", log:"X-RateLimit-Limit / -Remaining / -Reset (+ Retry-After if blocked)" }]
+        ],
+        edges: [
+          ["c","disp"],["disp","res"],["res","uk"],["uk","gl"],["gl","crl"],
+          ["crl","ia"],["ia","rd"],["rd","ep","allowed"],["rd","r429","blocked",true],
+          ["ep","resp"],["r429","resp"]
+        ]
+      },
+      flow: {
+        title: "Call Graph \u2014 modules & functions",
+        sub: "Every node is a [module/function]; arrows are invocations. Dashed = observability side-channel.",
+        layers: [
+          [{ id:"c", t:"ext", label:"HTTP Request", desc:"Client request entering the app.", log:"\u2014" }],
+          [{ id:"disp", t:"mw", label:"middleware / dispatch", desc:"Central enforcement point for every request.", log:"[middleware/RateLimitMiddleware.dispatch] invoked | method=... path=..." }],
+          [
+            { id:"res", t:"mw", label:"middleware / _resolve", desc:"Picks limit/period/key_func for the path.", log:"[middleware/RateLimitMiddleware._resolve] invoked | path=..." },
+            { id:"gl", t:"lim", label:"limiter / get_rate_limiter", desc:"Returns / lazily builds the singleton.", log:"[limiter/get_rate_limiter] invoked" },
+            { id:"crl", t:"lim", label:"limiter / check_rate_limit", desc:"Delegates to the configured strategy.", log:"[limiter/RateLimiter.check_rate_limit] invoked | identifier=... limit=... period=..." }
+          ],
+          [
+            { id:"kd", t:"key", label:"middleware / _default_key_func", desc:"Default IP-based identifier.", log:"[middleware/RateLimitMiddleware._default_key_func] invoked" },
+            { id:"uk", t:"key", label:"main / user_key", desc:"Per-user identifier (used by /api/user).", log:"[main/user_key] invoked" },
+            { id:"ek", t:"key", label:"main / endpoint_ip_key", desc:"Per-endpoint+IP identifier (used by /api/strict).", log:"[main/endpoint_ip_key] invoked" },
+            { id:"con", t:"lim", label:"limiter / connect", desc:"Builds the Redis connection pool.", log:"[limiter/RateLimiter.connect] invoked | strategy_type=..." },
+            { id:"ia", t:"strat", label:"strategies / *.is_allowed", desc:"Fixed / Sliding / Token implementation.", log:"[strategies/<Strategy>.is_allowed] invoked | key=... limit=... period=..." },
+            { id:"ep", t:"ep", label:"main / endpoint", desc:"The matched route handler (if allowed).", log:"[main/<endpoint>] invoked" }
+          ],
+          [
+            { id:"kc", t:"key", label:"main / get_client_identifier", desc:"Shared helper returning ip:<host>.", log:"[main/get_client_identifier] invoked" },
+            { id:"rf", t:"redis", label:"redis.from_url", desc:"Establishes the async connection pool.", log:"[limiter/RateLimiter.connect] -> redis.from_url" },
+            { id:"rds", t:"redis", label:"Redis \u00b7 eval / pipeline", desc:"Atomic Lua eval or pipelined commands.", log:"[strategies/<Strategy>.is_allowed] -> redis.eval / redis.pipeline.execute" },
+            { id:"mon", t:"mon", label:"monitoring / record_check", desc:"Prometheus counters / histograms.", log:"[monitoring/RateLimitMonitor.record_check] invoked | identifier=... strategy=..." },
+            { id:"resp", t:"ext", label:"Response + headers", desc:"Final response to the client.", log:"X-RateLimit-* headers" }
+          ]
+        ],
+        edges: [
+          ["c","disp"],["disp","res"],["disp","gl"],["disp","crl"],["disp","ep","allowed"],
+          ["res","kd"],["res","uk"],["res","ek"],["uk","kc"],["ek","kc"],
+          ["gl","con"],["con","rf"],["crl","ia"],["ia","rds"],["crl","mon","observability",true],["ep","resp"]
+        ]
+      },
+      strat: {
+        title: "Strategies \u2014 Redis operations per algorithm",
+        sub: "What each strategy method issues to Redis.",
+        layers: [
+          [
+            { id:"fwi", t:"strat", label:"FixedWindow / is_allowed", desc:"Increment current window counter.", log:"[strategies/FixedWindowStrategy.is_allowed] invoked" },
+            { id:"fwr", t:"strat", label:"FixedWindow / reset", desc:"Scan + delete all window keys.", log:"[strategies/FixedWindowStrategy.reset] invoked" },
+            { id:"swi", t:"strat", label:"SlidingWindow / is_allowed", desc:"Atomic sorted-set check-and-add.", log:"[strategies/SlidingWindowStrategy.is_allowed] invoked" },
+            { id:"swr", t:"strat", label:"SlidingWindow / reset", desc:"Delete the sorted-set key.", log:"[strategies/SlidingWindowStrategy.reset] invoked" },
+            { id:"tbi", t:"strat", label:"TokenBucket / is_allowed", desc:"Refill + consume a token.", log:"[strategies/TokenBucketStrategy.is_allowed] invoked" },
+            { id:"tbr", t:"strat", label:"TokenBucket / reset", desc:"Delete the bucket hash key.", log:"[strategies/TokenBucketStrategy.reset] invoked" }
+          ],
+          [
+            { id:"fwio", t:"redis", label:"pipeline: INCR + EXPIRE", desc:"Single round-trip increment with TTL.", log:"[strategies/FixedWindowStrategy.is_allowed] -> redis.pipeline.execute (INCR, EXPIRE)" },
+            { id:"fwro", t:"redis", label:"SCAN + DELETE", desc:"Iterate matching keys and delete.", log:"[strategies/FixedWindowStrategy.reset] -> redis.scan / redis.delete" },
+            { id:"swio", t:"redis", label:"eval Lua: ZREMRANGEBYSCORE, ZCARD, ZADD, EXPIRE, ZRANGE", desc:"Atomic sliding-window evaluation.", log:"[strategies/SlidingWindowStrategy.is_allowed] -> redis.eval (sliding-window Lua)" },
+            { id:"swro", t:"redis", label:"DELETE", desc:"Remove the sliding-window key.", log:"[strategies/SlidingWindowStrategy.reset] -> redis.delete" },
+            { id:"tbio", t:"redis", label:"eval Lua: HMGET, HMSET, EXPIRE", desc:"Atomic token-bucket evaluation.", log:"[strategies/TokenBucketStrategy.is_allowed] -> redis.eval (token-bucket Lua)" },
+            { id:"tbro", t:"redis", label:"DELETE", desc:"Remove the token-bucket key.", log:"[strategies/TokenBucketStrategy.reset] -> redis.delete" }
+          ]
+        ],
+        edges: [
+          ["fwi","fwio"],["fwr","fwro"],["swi","swio"],["swr","swro"],["tbi","tbio"],["tbr","tbro"]
+        ]
+      }
+    };
+
+    const SVGNS = "http://www.w3.org/2000/svg";
+    const layersEl = document.getElementById("layers");
+    const svgEl = document.getElementById("edges");
+    const detailEl = document.getElementById("detail");
+    let current = null;
+
+    function esc(s) {
+      return String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+    }
+
+    function render(key) {
+      const g = GRAPHS[key];
+      document.getElementById("gtitle").textContent = g.title;
+      document.getElementById("gsub").textContent = g.sub;
+      [...layersEl.querySelectorAll(".layer")].forEach(e => e.remove());
+
+      const nodeEls = {}, allNodes = {};
+      g.layers.forEach(col => {
+        const cEl = document.createElement("div");
+        cEl.className = "layer";
+        col.forEach(n => {
+          const d = document.createElement("div");
+          d.className = "node";
+          d.style.borderLeft = "4px solid " + TYPES[n.t].c;
+          d.innerHTML = '<div class="ntag">' + esc(TYPES[n.t].t) + '</div><div class="nlabel">' + esc(n.label) + '</div>';
+          d.addEventListener("click", () => select(n.id));
+          cEl.appendChild(d);
+          nodeEls[n.id] = d;
+          allNodes[n.id] = n;
+        });
+        layersEl.appendChild(cEl);
+      });
+
+      current = { g, nodeEls, allNodes, paths: [] };
+      requestAnimationFrame(drawEdges);
+    }
+
+    function drawEdges() {
+      if (!current) return;
+      current.paths.forEach(p => p.el.remove());
+      current.paths = [];
+      svgEl.setAttribute("width", layersEl.scrollWidth);
+      svgEl.setAttribute("height", layersEl.scrollHeight);
+      current.g.edges.forEach(([from, to, label, dashed]) => {
+        const a = current.nodeEls[from], b = current.nodeEls[to];
+        if (!a || !b) return;
+        const x1 = a.offsetLeft + a.offsetWidth, y1 = a.offsetTop + a.offsetHeight / 2;
+        const x2 = b.offsetLeft, y2 = b.offsetTop + b.offsetHeight / 2;
+        const dx = Math.max(40, Math.abs(x2 - x1) / 2);
+        const path = document.createElementNS(SVGNS, "path");
+        path.setAttribute("d", `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`);
+        path.setAttribute("class", "edge");
+        if (dashed) path.setAttribute("stroke-dasharray", "5,4");
+        svgEl.appendChild(path);
+        current.paths.push({ el: path, from, to });
+      });
+    }
+
+    function select(id) {
+      if (!current) return;
+      const { nodeEls, allNodes, paths } = current;
+      const neighbors = new Set([id]);
+      paths.forEach(p => { if (p.from === id) neighbors.add(p.to); if (p.to === id) neighbors.add(p.from); });
+      Object.entries(nodeEls).forEach(([nid, el]) => {
+        el.classList.toggle("sel", nid === id);
+        el.classList.toggle("dim", !neighbors.has(nid));
+      });
+      paths.forEach(p => {
+        const touch = p.from === id || p.to === id;
+        p.el.classList.toggle("hl", touch);
+        p.el.classList.toggle("dim", !touch);
+      });
+      const n = allNodes[id];
+      detailEl.innerHTML =
+        '<span class="badge" style="background:' + TYPES[n.t].c + '">' + esc(TYPES[n.t].t) + '</span>' +
+        '<h3>' + esc(n.label) + '</h3>' +
+        '<p>' + esc(n.desc) + '</p>' +
+        '<div class="log">' + esc(n.log) + '</div>';
+    }
+
+    document.querySelectorAll(".tab").forEach(t => {
+      t.addEventListener("click", () => {
+        document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+        t.classList.add("active");
+        detailEl.innerHTML = '<h3>Click any node</h3><p class="muted">Select a box to see its role and the exact <code>[module/function]</code> log line.</p>';
+        render(t.dataset.key);
+      });
+    });
+
+    window.addEventListener("resize", () => requestAnimationFrame(drawEdges));
+    render("seq");
+  </script>
+</body>
+</html>
