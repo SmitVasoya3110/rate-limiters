@@ -1,6 +1,7 @@
 from fastapi import Request, status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from app.rules import SKIP, DEFER
 import logging
 
 logger = logging.getLogger(__name__)
@@ -20,10 +21,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         logger.info(f"[middleware/RateLimitMiddleware.dispatch] invoked | method={request.method} path={request.url.path}")
         resolver = request.app.state.rule_resolver
         logger.info("[middleware/RateLimitMiddleware.dispatch] -> rule_resolver.resolve")
-        decision = await resolver.resolve(request)
-        if decision is None:
-            logger.info(f"[middleware/RateLimitMiddleware.dispatch] no rule, skipping rate limit | path={request.url.path}")
+        outcome = await resolver.resolve(request)
+
+        if outcome is SKIP:
+            logger.info(f"[middleware/RateLimitMiddleware.dispatch] SKIP, bypassing rate limit | path={request.url.path}")
             return await call_next(request)
+
+        if outcome is DEFER:
+            logger.error(
+                "[middleware/RateLimitMiddleware.dispatch] rule chain terminated with DEFER "
+                f"(misconfiguration: last resolver should be terminal) | path={request.url.path}"
+            )
+            return await call_next(request)
+
+        decision = outcome.decision
         
         limiter = request.app.state.limiter
         logger.info("[middleware/RateLimitMiddleware.dispatch] -> limiter.check_rate_limit")

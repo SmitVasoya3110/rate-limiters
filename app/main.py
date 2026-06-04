@@ -8,7 +8,7 @@ from starlette.responses import Response
 from app.rate_limiter.limiter import RateLimiter, StrategyType
 from app.redis_client import init_pool, get_client, close_pool
 from app.middleware import RateLimitMiddleware
-from app.rules import StaticRuleResolver, RateLimitRule
+from app.rules import StaticRuleResolver, RateLimitRule, ChainResolver, RedisOverrideResolver
 from app.config import settings
 
 logging.basicConfig(
@@ -16,6 +16,43 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def get_client_identifier(request: Request) -> str:
+    logger.info("[main/get_client_identifier] invoked")
+    return f"ip:{request.client.host}" if request.client else "ip:unknown"
+
+
+def user_key(request: Request) -> str:
+    logger.info("[main/user_key] invoked")
+    user_id = getattr(request.state, "user_id", None)
+    if user_id:
+        return f"user:{user_id}"
+    return get_client_identifier(request)
+
+
+def endpoint_ip_key(request: Request) -> str:
+    logger.info("[main/endpoint_ip_key] invoked")
+    return f"endpoint:{request.url.path}:{get_client_identifier(request)}"
+
+
+rule_resolver = ChainResolver([
+    # Dynamic, per-subscription overrides (evolve limits via Redis, no deploy).
+    # Defers when no override exists, so the static rules below apply.
+    RedisOverrideResolver(default_key_func=get_client_identifier),
+    # Terminal: static path rules + defaults (never defers).
+    StaticRuleResolver(
+        default_limit=100,
+        default_period=60,
+        default_key_func=get_client_identifier,
+        excluded_paths=["/", "/health", "/metrics"],
+        path_rules={
+            "/api/limited": RateLimitRule(limit=10, period=60),
+            "/api/user": RateLimitRule(limit=50, period=60, key_func=user_key),
+            "/api/strict": RateLimitRule(limit=5, period=60, key_func=endpoint_ip_key),
+        },
+    ),
+])
 
 
 @asynccontextmanager
@@ -153,37 +190,6 @@ async def check_status(identifier: str, limiter: RateLimiter = Depends(get_limit
             status_code=500,
             content={"error": str(e)}
         )
-
-
-def get_client_identifier(request: Request) -> str:
-    logger.info("[main/get_client_identifier] invoked")
-    return f"ip:{request.client.host}" if request.client else "ip:unknown"
-
-
-def user_key(request: Request) -> str:
-    logger.info("[main/user_key] invoked")
-    user_id = getattr(request.state, "user_id", None)
-    if user_id:
-        return f"user:{user_id}"
-    return get_client_identifier(request)
-
-
-def endpoint_ip_key(request: Request) -> str:
-    logger.info("[main/endpoint_ip_key] invoked")
-    return f"endpoint:{request.url.path}:{get_client_identifier(request)}"
-
-
-rule_resolver = StaticRuleResolver(
-    default_limit=100,
-    default_period=60,
-    default_key_func=get_client_identifier,
-    excluded_paths=["/", "/health", "/metrics"],
-    path_rules={
-        "/api/limited": RateLimitRule(limit=10, period=60),
-        "/api/user": RateLimitRule(limit=50, period=60, key_func=user_key),
-        "/api/strict": RateLimitRule(limit=5, period=60, key_func=endpoint_ip_key),
-    },
-)
 
 
 app.add_middleware(RateLimitMiddleware)
